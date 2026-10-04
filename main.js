@@ -1,8 +1,10 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, normalizePath, Platform } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, normalizePath } = require('obsidian');
 
 const CLIPBOARD_THROTTLE_MS = 2 * 1000;
+// この時間内に編集していたら、自動ではノートを切り替えない
+const EDIT_GRACE_MS = 10 * 1000;
 
 const DEFAULT_SETTINGS = {
   folder: '00_Refs',
@@ -19,6 +21,7 @@ module.exports = class ZoteroRefs extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.lastClipboardAt = 0;
+    this.lastEditAt = 0;
     // Web API 連携をやめたので、以前の版が端末に保存した APIキーなどを消す
     for (const key of ['api-key', 'user-id', 'username', 'auto-sync', 'last-version', 'last-synced-at', 'last-check']) {
       this.setLocal(`zrs-${key}`, null);
@@ -38,15 +41,15 @@ module.exports = class ZoteroRefs extends Plugin {
       this.openFromCitation(params.text ?? params.doi ?? '')
     );
 
+    // 書きかけのノートを自動で切り替えないよう、最後に編集した時刻を覚えておく
+    this.registerEvent(this.app.workspace.on('editor-change', () => (this.lastEditAt = Date.now())));
+
     this.app.workspace.onLayoutReady(() => {
-      this.checkClipboard('起動');
-      // Android ではアプリ切替から戻っても再起動にならないので、前面に戻ったときにも確認する。
-      // WebView によって発火するイベントが違うので複数拾い、スロットルで1回にまとめる
+      this.checkClipboard();
+      // Android ではアプリ切替から戻っても再起動にならないので、前面に戻ったときに確認する
       this.registerDomEvent(document, 'visibilitychange', () => {
-        if (document.visibilityState === 'visible') this.checkClipboard('visibilitychange');
+        if (document.visibilityState === 'visible') this.checkClipboard();
       });
-      this.registerDomEvent(document, 'resume', () => this.checkClipboard('resume'));
-      this.registerDomEvent(window, 'focus', () => this.checkClipboard('focus'));
     });
   }
 
@@ -65,8 +68,7 @@ module.exports = class ZoteroRefs extends Plugin {
   // ---------- クリップボード ----------
 
   clipboardWatchEnabled() {
-    const v = this.local(LS.clipWatch);
-    return v == null ? Platform.isMobile : v === 'true';
+    return this.local(LS.clipWatch) === 'true';
   }
 
   async readClipboard() {
@@ -79,12 +81,12 @@ module.exports = class ZoteroRefs extends Plugin {
     }
   }
 
-  recordClipboard(trigger, result) {
-    this.setLocal(LS.clipStatus, `${new Date().toLocaleString()} / ${trigger} / ${result}`);
+  recordClipboard(result) {
+    this.setLocal(LS.clipStatus, `${new Date().toLocaleString()} / ${result}`);
   }
 
-  // Zotero の「Copy bibliography」でコピーした書誌がクリップボードにあれば、そのノートを開く
-  async checkClipboard(trigger) {
+  // 自動確認（オンのときだけ）: Zotero の「Copy bibliography」でコピーした書誌があれば、そのノートを開く
+  async checkClipboard() {
     if (!this.clipboardWatchEnabled()) return;
     const now = Date.now();
     if (now - this.lastClipboardAt < CLIPBOARD_THROTTLE_MS) return;
@@ -94,14 +96,13 @@ module.exports = class ZoteroRefs extends Plugin {
     try {
       text = (await this.readClipboard())?.trim();
     } catch (e) {
-      this.recordClipboard(trigger, `読み取り失敗: ${e.message ?? e}`);
+      this.recordClipboard(`読み取り失敗: ${e.message ?? e}`);
       return;
     }
-    if (!text || !extractDoi(text)) return this.recordClipboard(trigger, 'DOIなし');
-    if (text === this.local(LS.clipText)) return this.recordClipboard(trigger, '処理済みの書誌');
+    if (!looksLikeCitation(text) || text === this.local(LS.clipText)) return;
     this.setLocal(LS.clipText, text);
-    this.recordClipboard(trigger, `DOI ${extractDoi(text)}`);
-    await this.openFromCitation(text);
+    this.recordClipboard(`DOI ${extractDoi(text)}`);
+    await this.openFromCitation(text, { auto: true });
   }
 
   async openFromClipboard() {
@@ -116,27 +117,50 @@ module.exports = class ZoteroRefs extends Plugin {
 
   // ---------- ノート ----------
 
-  async openFromCitation(text) {
+  async openFromCitation(text, { auto = false } = {}) {
+    const doi = extractDoi(text);
+    const title = extractTitle(text);
+    if (doi) return this.openOrCreate({ doi, title }, { auto });
+    if (!title) {
+      new Notice('Zotero: 書誌に DOI が見つかりません');
+      return;
+    }
+    // DOI がないときは題名だけで照合・作成するので、確認してから進める
+    this.noticeWithAction(`Zotero: DOI がありません。題名で開きますか？\n${title}`, '題名で開く', () =>
+      this.openOrCreate({ doi: null, title })
+    );
+  }
+
+  async openOrCreate({ doi, title }, { auto = false } = {}) {
     try {
-      const doi = extractDoi(text);
-      const title = extractTitle(text);
-      if (!doi && !title) {
-        new Notice('Zotero: 書誌から DOI も題名も読み取れませんでした');
+      let file = this.findNote({ doi, title });
+      if (!file) {
+        const fetched = doi ? await this.fetchDoi(doi).catch((e) => console.warn('[zotero-refs]', e)) : null;
+        file = await this.writeNote(fetched ?? { title: title ?? doi, DOI: doi ?? '', creators: [] });
+        new Notice(`Zotero: ノートを作成しました\n${file.basename}`);
+      }
+      // 自動確認のときは、書きかけのノートがあれば勝手に切り替えずボタンで開いてもらう
+      if (auto && Date.now() - this.lastEditAt < EDIT_GRACE_MS) {
+        this.noticeWithAction(`Zotero: ${file.basename}`, '開く', () => this.openFile(file));
         return;
       }
-      const existing = this.findNote({ doi, title });
-      if (existing) {
-        await this.openFile(existing);
-        return;
-      }
-      const fetched = doi ? await this.fetchDoi(doi).catch((e) => console.warn('[zotero-refs]', e)) : null;
-      const data = fetched ?? { title: title ?? doi, DOI: doi ?? '', creators: [] };
-      const file = await this.writeNote(data);
-      new Notice(`Zotero: ノートを作成しました\n${file.basename}`);
       await this.openFile(file);
     } catch (e) {
       this.fail('書誌からのノート作成', e);
     }
+  }
+
+  noticeWithAction(message, label, action) {
+    const notice = new Notice(
+      createFragment((f) => {
+        f.createDiv({ text: message });
+        f.createEl('button', { text: label }).addEventListener('click', () => {
+          notice.hide();
+          action();
+        });
+      }),
+      15 * 1000
+    );
   }
 
   // doi.org のコンテントネゴシエーションで CSL-JSON を取る
@@ -168,8 +192,15 @@ module.exports = class ZoteroRefs extends Plugin {
     );
   }
 
+  // 今のタブは書きかけかもしれないので置き換えない。開いているタブがあればそこへ移る
   async openFile(file) {
-    await this.app.workspace.getLeaf(false).openFile(file);
+    const { workspace } = this.app;
+    const leaf = workspace.getLeavesOfType('markdown').find((l) => l.view.file?.path === file.path);
+    if (leaf) {
+      workspace.setActiveLeaf(leaf, { focus: true });
+      return;
+    }
+    await workspace.getLeaf('tab').openFile(file);
   }
 
   async writeNote(data) {
@@ -192,6 +223,12 @@ module.exports = class ZoteroRefs extends Plugin {
 // 書誌の書式によらず DOI を拾う（末尾の句読点は除く）
 function extractDoi(text) {
   return (text ?? '').match(/\b10\.\d{4,9}\/[^\s"<>]+/)?.[0].replace(/[.,;:)\]]+$/, '') ?? null;
+}
+
+// 自動確認で反応するのは Zotero の書誌らしいテキストだけ（DOI と出版年があり、長すぎない）
+function looksLikeCitation(text) {
+  const doi = extractDoi(text);
+  return !!doi && text.length > doi.length + 20 && text.length <= 1000 && /\b(19|20)\d{2}\b/.test(text);
 }
 
 // Chicago など題名を引用符で囲む書式から題名を拾う
@@ -328,8 +365,8 @@ class ZoteroRefsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('前面に戻ったときにクリップボードを確認')
-      .setDesc('Zotero の「Copy bibliography」でコピーした書誌に DOI があれば、そのノートを開きます（なければ作成）。この端末にだけ保存されます')
+      .setName('前面に戻ったときにクリップボードを自動確認')
+      .setDesc('オンにすると、Obsidian に戻ったときにクリップボードの書誌（DOI 入り）のノートを開きます。オフ（初期値）のときは 📋 ボタンか共有メニュー（obsidian://zotero-refs）から開きます。この端末にだけ保存されます')
       .addToggle((t) =>
         t.setValue(p.clipboardWatchEnabled()).onChange((v) => p.setLocal(LS.clipWatch, v ? 'true' : 'false'))
       );
