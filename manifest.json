@@ -1,0 +1,9 @@
+{
+  "id": "zotero-refs-sync",
+  "name": "Zotero Refs",
+  "version": "0.3.2",
+  "minAppVersion": "1.4.0",
+  "description": "Zotero の Copy bibliography から 00_Refs の文献ノートを開く・作成する",
+  "author": "ritar",
+  "isDesktopOnly": false
+}
